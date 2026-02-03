@@ -48,7 +48,19 @@ export default function App() {
   const [status, setStatus] = useState("Idle");
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // Session keys are still useful for protocol state signing without wallet prompts
+  const [activeChannelInfo, setActiveChannelInfo] = useState<{
+    id: string;
+    token: string;
+    client: NitroliteClient;
+    publicClient: any;
+  } | null>(null);
+  const [isDepositing, setIsDepositing] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+  const [isDepositDone, setIsDepositDone] = useState(false);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const heartbeatIntervalRef = useRef<any>(null);
+
   const sessionKeyRef = useRef<{
     privateKey: `0x${string}`;
     address: `0x${string}`;
@@ -64,6 +76,30 @@ export default function App() {
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
+
+  useEffect(() => {
+    return () => {
+      stopHeartbeat();
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, []);
+
+  const startHeartbeat = () => {
+    stopHeartbeat();
+    heartbeatIntervalRef.current = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({ method: "ping", params: [], id: Date.now() }),
+        );
+      }
+    }, 20000);
+  };
+
+  const stopHeartbeat = () => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+    }
+  };
 
   const connectWallet = async () => {
     if (!(window as any).ethereum) {
@@ -85,7 +121,6 @@ export default function App() {
         return;
       }
 
-      // Create wallet client with account for EIP-712 signing
       const walletClient = createWalletClient({
         account: address,
         chain: chainInfo.chain,
@@ -136,6 +171,69 @@ export default function App() {
     });
   }
 
+  const handleDeposit = async () => {
+    if (!activeChannelInfo || !account) return;
+    const { token, client, publicClient } = activeChannelInfo;
+
+    setIsDepositing(true);
+    addLog("Manual Deposit Initiated...");
+
+    try {
+      const depositAmount = 20n;
+      addLog(`Depositing ${depositAmount} units to Custody...`);
+      const depositTx = await client.deposit(
+        token as `0x${string}`,
+        depositAmount,
+      );
+      addLog(`✓ Deposit transaction sent: ${depositTx}`);
+      addLog("Waiting for deposit confirmation...");
+      await publicClient.waitForTransactionReceipt({ hash: depositTx });
+      addLog("✓ Deposit confirmed on-chain. You can now Resize.");
+      setIsDepositDone(true);
+    } catch (error: any) {
+      addLog(`Error during deposit: ${error.message || error}`);
+    } finally {
+      setIsDepositing(false);
+    }
+  };
+
+  const handleResize = async () => {
+    if (!activeChannelInfo || !account || !wsRef.current) return;
+    const { id } = activeChannelInfo;
+
+    setIsResizing(true);
+    addLog("Manual Resize Initiated...");
+
+    try {
+      const resizeAmount = 20n;
+      addLog(`Requesting resize for ${resizeAmount} units...`);
+
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+
+      const resizeMsg = await createResizeChannelMessage(sessionSigner, {
+        channel_id: id as `0x${string}`,
+        allocate_amount: resizeAmount,
+        funds_destination: account,
+      });
+
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(resizeMsg);
+        addLog("Sent resize_channel message.");
+        setActiveChannelInfo(null);
+        setIsDepositDone(false); // Reset for potential future channels
+      } else {
+        addLog("Error: WebSocket connection lost. Please restart the flow.");
+      }
+    } catch (error: any) {
+      addLog(`Error during resize: ${error.message || error}`);
+    } finally {
+      setIsResizing(false);
+    }
+  };
+
   const runFlow = async () => {
     if (!account || !walletClientState) {
       addLog("Error: Wallet not connected");
@@ -146,12 +244,13 @@ export default function App() {
     setStatus("Running");
     setLogs([]);
     addLog("Starting flow...");
+    setActiveChannelInfo(null);
+    setIsDepositDone(false);
 
     try {
       const chainInfo = SUPPORTED_CHAINS.find((c) => c.id === selectedChainId)!;
       addLog(`Selected Chain: ${chainInfo.name}`);
 
-      // Ensure network matches
       const currentChainId = await walletClientState.getChainId();
       if (currentChainId !== selectedChainId) {
         addLog(`Switching network to ${chainInfo.name}...`);
@@ -179,7 +278,6 @@ export default function App() {
         transport: http(rpcUrl),
       });
 
-      // Re-initialize session key for this run if not exists
       if (!sessionKeyRef.current) {
         const sessionPrivateKey = generatePrivateKey();
         const sessionAccount = privateKeyToAccount(sessionPrivateKey);
@@ -196,29 +294,10 @@ export default function App() {
         `Configuration fetched. Assets: ${config.assets?.length}, Networks: ${config.networks?.length}`,
       );
 
-      const networkConfig = config.networks?.find(
-        (n) => n.chain_id === selectedChainId,
-      );
       const addresses = {
         custody: "0x019B65A265EB3363822f2752141b3dF16131b262",
-        // networkConfig?.custody ||
-        // (selectedChainId === sepolia.id
-        //   ? "0x019B65A265EB3363822f2752141b3dF16131b262"
-        //   : undefined),
         adjudicator: "0x7c7ccbc98469190849BCC6c926307794fDfB11F2",
-        // networkConfig?.adjudicator ||
-        // (selectedChainId === sepolia.id
-        //   ? "0x7c7ccbc98469190849BCC6c926307794fDfB11F2"
-        //   : undefined),
       };
-
-      if (!addresses.custody) {
-        throw new Error(
-          `Custody address not found for chain ID ${selectedChainId}`,
-        );
-      }
-
-      addLog(`Custody: ${addresses.custody}`);
 
       const client = new NitroliteClient({
         publicClient,
@@ -231,7 +310,9 @@ export default function App() {
 
       addLog("✓ Nitrolite Client initialized");
 
+      if (wsRef.current) wsRef.current.close();
       const ws = new WebSocket("wss://clearnet-sandbox.yellow.com/ws");
+      wsRef.current = ws;
 
       const authParams = {
         session_key: sessionKeyRef.current.address,
@@ -253,83 +334,21 @@ export default function App() {
 
       let isAuthenticated = false;
 
-      const triggerResize = async (
-        channelId: string,
-        token: string,
-        skipResize: boolean = false,
-      ) => {
-        addLog(`  Using existing channel: ${channelId}`);
-        addLog("  Waiting 5s for Node to index channel...");
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-
-        const amountToFund = 20n;
-        if (!skipResize) {
-          addLog("Requesting resize to fund channel with 20 tokens...");
-          const resizeMsg = await createResizeChannelMessage(sessionSigner, {
-            channel_id: channelId as `0x${string}`,
-            allocate_amount: amountToFund,
-            funds_destination: account,
-          });
-          ws.send(resizeMsg);
-
-          await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(
-              () => reject(new Error("Resize timeout")),
-              60000,
-            );
-            const handler = (event: MessageEvent) => {
-              const msg = JSON.parse(event.data.toString());
-              if (msg.res && msg.res[1] === "resize_channel") {
-                const payload = msg.res[2];
-                if (payload.channel_id === channelId) {
-                  clearTimeout(timeout);
-                  ws.removeEventListener("message", handler);
-                  resolve();
-                }
-              }
-            };
-            ws.addEventListener("message", handler);
-          });
-
-          addLog("✓ Resize complete.");
-        } else {
-          addLog("  Skipping resize step (already funded).");
-        }
-
-        try {
-          const channelBalances = (await publicClient.readContract({
-            address: client.addresses.custody,
-            abi: [
-              {
-                name: "getChannelBalances",
-                type: "function",
-                stateMutability: "view",
-                inputs: [
-                  { name: "channelId", type: "bytes32" },
-                  { name: "tokens", type: "address[]" },
-                ],
-                outputs: [{ name: "balances", type: "uint256[]" }],
-              },
-            ],
-            functionName: "getChannelBalances",
-            args: [channelId as `0x${string}`, [token as `0x${string}`]],
-          })) as bigint[];
-          addLog(`✓ Channel funded with ${channelBalances[0]} units`);
-        } catch (e) {
-          addLog(`Error checking channel balances: ${e}`);
-        }
-      };
-
       ws.onopen = () => {
         ws.send(authRequestMsg);
         addLog("Sent auth_request (Requesting Wallet Signature...)");
+        startHeartbeat();
       };
 
       ws.onmessage = async (event) => {
         const response = JSON.parse(event.data.toString());
 
+        if (response.method === "pong") return;
+
         if (response.error) {
+          if (response.id && typeof response.id === "number") return;
           addLog(`RPC Error: ${JSON.stringify(response.error)}`);
+          stopHeartbeat();
           ws.close();
           setIsRunning(false);
           setStatus("Error");
@@ -386,6 +405,7 @@ export default function App() {
 
           if (!token) {
             addLog(`Error: No token found for chain ID ${selectedChainId}`);
+            stopHeartbeat();
             ws.close();
             setIsRunning(false);
             setStatus("Error");
@@ -393,18 +413,19 @@ export default function App() {
           }
 
           if (openChannel) {
-            addLog("✓ Found existing open channel");
-            if (BigInt(openChannel.amount) >= 20n) {
-              addLog(
-                `  Channel already funded with ${openChannel.amount} units.`,
-              );
-              await triggerResize(openChannel.channel_id, token, true);
-            } else {
-              await triggerResize(openChannel.channel_id, token, false);
-            }
+            addLog("✓ Found existing open channel.");
+            addLog(
+              "Manual Action Required: Please Deposit Assets then Resize Channel.",
+            );
+            setActiveChannelInfo({
+              id: openChannel.channel_id,
+              token,
+              client,
+              publicClient,
+            });
           } else {
             addLog(
-              `  No existing open channel found on chain ${selectedChainId}, creating new one...`,
+              `No existing open channel found on chain ${selectedChainId}, creating new one...`,
             );
             const createChannelMsg = await createCreateChannelMessage(
               sessionSigner,
@@ -415,10 +436,9 @@ export default function App() {
         }
 
         if (response.res && response.res[1] === "create_channel") {
-          const { channel_id, channel, state, server_signature } =
-            response.res[2];
+          const { channel_id, state } = response.res[2];
           addLog(
-            `✓ Channel prepared: ${channel_id}. Approving L1 Transaction...`,
+            `✓ Channel prepared: ${channel_id}. Approving creation on L1...`,
           );
 
           const unsignedInitialState = {
@@ -433,9 +453,9 @@ export default function App() {
           };
 
           const createResult = await client.createChannel({
-            channel,
+            channel: response.res[2].channel,
             unsignedInitialState,
-            serverSignature: server_signature,
+            serverSignature: response.res[2].server_signature,
           });
 
           const txHash =
@@ -445,10 +465,13 @@ export default function App() {
           addLog(`✓ Channel created on-chain: ${txHash}`);
           addLog("  Waiting for transaction confirmation...");
           await publicClient.waitForTransactionReceipt({ hash: txHash });
-          addLog("✓ Transaction confirmed");
+          addLog("✓ Transaction confirmed.");
 
           const token = state.allocations[0].token;
-          await triggerResize(channel_id, token, false);
+          addLog(
+            "Manual Action Required: Please Deposit Assets then Resize Channel.",
+          );
+          setActiveChannelInfo({ id: channel_id, token, client, publicClient });
         }
 
         if (response.res && response.res[1] === "resize_channel") {
@@ -478,7 +501,7 @@ export default function App() {
           );
 
           addLog(
-            `  Waiting for user to fund Custody (Required: ${requiredAmount})...`,
+            `Waiting for user to fund Custody (Required: ${requiredAmount})...`,
           );
 
           let userBalance = 0n;
@@ -504,17 +527,17 @@ export default function App() {
               })) as bigint[];
               userBalance = result[0];
             } catch (e) {
-              addLog(`    Error checking balance: ${e}`);
+              addLog(`Error checking balance: ${e}`);
             }
 
             if (userBalance >= requiredAmount) break;
             await new Promise((r) => setTimeout(r, 2000));
             retries++;
             if (retries % 5 === 0)
-              addLog(`    User Balance: ${userBalance}, Waiting...`);
+              addLog(`User Balance: ${userBalance}, Waiting...`);
           }
 
-          addLog("  Submitting resize to L1 (Approving Wallet Transaction)...");
+          addLog("Submitting resize to L1 (Approving Wallet Transaction)...");
           const { txHash } = await client.resizeChannel({
             resizeState,
             proofStates: [],
@@ -523,7 +546,7 @@ export default function App() {
           addLog(`✓ Channel resized on-chain: ${txHash}`);
           await new Promise((r) => setTimeout(r, 3000));
 
-          addLog(`  Closing channel: ${channel_id}`);
+          addLog(`Closing channel: ${channel_id}`);
           const closeMsg = await createCloseChannelMessage(
             sessionSigner,
             channel_id as `0x${string}`,
@@ -553,7 +576,7 @@ export default function App() {
           });
 
           addLog(`✓ Channel closed on-chain: ${txHash}`);
-          addLog("  Withdrawing funds...");
+          addLog("Withdrawing funds...");
           const token = state.allocations[0].token;
           await new Promise((r) => setTimeout(r, 2000));
 
@@ -577,16 +600,17 @@ export default function App() {
           const balance = result[0];
 
           if (balance > 0n) {
-            addLog(`  Withdrawing ${balance} of ${token}...`);
+            addLog(`Withdrawing ${balance} of ${token}...`);
             const withdrawalTx = await client.withdrawal(
               token as `0x${string}`,
               balance,
             );
             addLog(`✓ Funds withdrawn: ${withdrawalTx}`);
           } else {
-            addLog("  No funds to withdraw.");
+            addLog("No funds to withdraw.");
           }
 
+          stopHeartbeat();
           setStatus("Completed");
           setIsRunning(false);
           ws.close();
@@ -595,9 +619,15 @@ export default function App() {
 
       ws.onerror = (error) => {
         addLog(`WebSocket Error: ${JSON.stringify(error)}`);
+        stopHeartbeat();
         ws.close();
         setIsRunning(false);
         setStatus("Error");
+      };
+
+      ws.onclose = () => {
+        stopHeartbeat();
+        addLog("WebSocket connection closed.");
       };
     } catch (error: any) {
       addLog(`Error: ${error.message || error}`);
@@ -645,7 +675,14 @@ export default function App() {
           </button>
           {account && (
             <button
-              onClick={() => setAccount(null)}
+              onClick={() => {
+                setAccount(null);
+                setStatus("Idle");
+                setActiveChannelInfo(null);
+                setIsDepositDone(false);
+                stopHeartbeat();
+                if (wsRef.current) wsRef.current.close();
+              }}
               style={{
                 padding: "10px",
                 backgroundColor: "#dc3545",
@@ -693,6 +730,51 @@ export default function App() {
         >
           {isRunning ? "Running..." : "Start Flow"}
         </button>
+
+        {activeChannelInfo && (
+          <div style={{ display: "flex", gap: "10px", marginTop: "5px" }}>
+            <button
+              onClick={handleDeposit}
+              disabled={isDepositing || isDepositDone}
+              style={{
+                padding: "15px 20px",
+                backgroundColor:
+                  isDepositing || isDepositDone ? "#ccc" : "#ffc107",
+                color: "black",
+                fontWeight: "bold",
+                borderRadius: "4px",
+                cursor:
+                  isDepositing || isDepositDone ? "not-allowed" : "pointer",
+                flex: 1,
+                border: "2px solid #e0a800",
+              }}
+            >
+              {isDepositing
+                ? "Depositing..."
+                : isDepositDone
+                  ? "✓ Assets Deposited"
+                  : "Step 1: Deposit Assets"}
+            </button>
+
+            <button
+              onClick={handleResize}
+              disabled={isResizing}
+              style={{
+                padding: "15px 20px",
+                backgroundColor: isResizing ? "#ccc" : "#28a745",
+                color: "white",
+                fontWeight: "bold",
+                border: "none",
+                borderRadius: "4px",
+                cursor: isResizing ? "not-allowed" : "pointer",
+                flex: 1,
+                border: "2px solid #1e7e34",
+              }}
+            >
+              {isResizing ? "Resizing..." : "Step 2: Resize Channel"}
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={{ marginBottom: "10px" }}>
