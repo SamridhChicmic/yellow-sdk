@@ -56,6 +56,7 @@ export default function App() {
   } | null>(null);
   const [isDepositing, setIsDepositing] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
+  const [isClosing, setIsClosing] = useState(false);
   const [isDepositDone, setIsDepositDone] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -205,7 +206,7 @@ export default function App() {
     addLog("Manual Resize Initiated...");
 
     try {
-      const resizeAmount = 20n;
+      const resizeAmount = 20000000n;
       addLog(`Requesting resize for ${resizeAmount} units...`);
 
       if (!sessionKeyRef.current) throw new Error("Session key missing");
@@ -216,14 +217,12 @@ export default function App() {
       const resizeMsg = await createResizeChannelMessage(sessionSigner, {
         channel_id: id as `0x${string}`,
         allocate_amount: resizeAmount,
-        funds_destination: account,
+        funds_destination: "0xc7E6827ad9DA2c89188fAEd836F9285E6bFdCCCC", // "0x5288dD861713219b9A4941484DE0CD53fA3C0334",
       });
 
       if (wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(resizeMsg);
         addLog("Sent resize_channel message.");
-        setActiveChannelInfo(null);
-        setIsDepositDone(false); // Reset for potential future channels
       } else {
         addLog("Error: WebSocket connection lost. Please restart the flow.");
       }
@@ -231,6 +230,38 @@ export default function App() {
       addLog(`Error during resize: ${error.message || error}`);
     } finally {
       setIsResizing(false);
+    }
+  };
+
+  const handleCloseChannel = async () => {
+    if (!activeChannelInfo || !account || !wsRef.current) return;
+    const { id } = activeChannelInfo;
+
+    setIsClosing(true);
+    addLog("Manual Close Channel Initiated...");
+
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+
+      addLog(`Sending close request for channel: ${id}`);
+      const closeMsg = await createCloseChannelMessage(
+        sessionSigner,
+        id as `0x${string}`,
+        account,
+      );
+
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(closeMsg);
+        addLog("Sent close_channel message.");
+      } else {
+        addLog("Error: WebSocket connection lost. Please restart the flow.");
+      }
+    } catch (error: any) {
+      addLog(`Error during channel close: ${error.message || error}`);
+      setIsClosing(false);
     }
   };
 
@@ -544,76 +575,78 @@ export default function App() {
           });
 
           addLog(`✓ Channel resized on-chain: ${txHash}`);
-          await new Promise((r) => setTimeout(r, 3000));
-
-          addLog(`Closing channel: ${channel_id}`);
-          const closeMsg = await createCloseChannelMessage(
-            sessionSigner,
-            channel_id as `0x${string}`,
-            account,
+          addLog(
+            "Manual Action Required: Please click Step 3: Close Channel when ready.",
           );
-          ws.send(closeMsg);
+          // We keep activeChannelInfo so the Close button can use it
         }
 
         if (response.res && response.res[1] === "close_channel") {
           const { channel_id, state, server_signature } = response.res[2];
           addLog("✓ Close prepared. Approving Wallet Transaction...");
 
-          const txHash = await client.closeChannel({
-            finalState: {
-              intent: state.intent,
-              version: BigInt(state.version),
-              data: state.state_data || state.data,
-              allocations: state.allocations.map((a: any) => ({
-                destination: a.destination,
-                token: a.token,
-                amount: BigInt(a.amount),
-              })),
-              channelId: channel_id,
-              serverSignature: server_signature,
-            },
-            stateData: state.state_data || state.data || "0x",
-          });
-
-          addLog(`✓ Channel closed on-chain: ${txHash}`);
-          addLog("Withdrawing funds...");
-          const token = state.allocations[0].token;
-          await new Promise((r) => setTimeout(r, 2000));
-
-          const result = (await publicClient.readContract({
-            address: client.addresses.custody,
-            abi: [
-              {
-                type: "function",
-                name: "getAccountsBalances",
-                inputs: [
-                  { name: "users", type: "address[]" },
-                  { name: "tokens", type: "address[]" },
-                ],
-                outputs: [{ type: "uint256[]" }],
-                stateMutability: "view",
+          try {
+            const txHash = await client.closeChannel({
+              finalState: {
+                intent: state.intent,
+                version: BigInt(state.version),
+                data: state.state_data || state.data,
+                allocations: state.allocations.map((a: any) => ({
+                  destination: a.destination,
+                  token: a.token,
+                  amount: BigInt(a.amount),
+                })),
+                channelId: channel_id,
+                serverSignature: server_signature,
               },
-            ] as const,
-            functionName: "getAccountsBalances",
-            args: [[account], [token as `0x${string}`]],
-          })) as bigint[];
-          const balance = result[0];
+              stateData: state.state_data || state.data || "0x",
+            });
 
-          if (balance > 0n) {
-            addLog(`Withdrawing ${balance} of ${token}...`);
-            const withdrawalTx = await client.withdrawal(
-              token as `0x${string}`,
-              balance,
-            );
-            addLog(`✓ Funds withdrawn: ${withdrawalTx}`);
-          } else {
-            addLog("No funds to withdraw.");
+            addLog(`✓ Channel closed on-chain: ${txHash}`);
+            addLog("Withdrawing funds...");
+            const token = state.allocations[0].token;
+            await new Promise((r) => setTimeout(r, 2000));
+
+            const result = (await publicClient.readContract({
+              address: client.addresses.custody,
+              abi: [
+                {
+                  type: "function",
+                  name: "getAccountsBalances",
+                  inputs: [
+                    { name: "users", type: "address[]" },
+                    { name: "tokens", type: "address[]" },
+                  ],
+                  outputs: [{ type: "uint256[]" }],
+                  stateMutability: "view",
+                },
+              ] as const,
+              functionName: "getAccountsBalances",
+              args: [[account], [token as `0x${string}`]],
+            })) as bigint[];
+            const balance = result[0];
+
+            if (balance > 0n) {
+              addLog(`Withdrawing ${balance} of ${token}...`);
+              const withdrawalTx = await client.withdrawal(
+                token as `0x${string}`,
+                balance,
+              );
+              addLog(`✓ Funds withdrawn: ${withdrawalTx}`);
+            } else {
+              addLog("No funds to withdraw.");
+            }
+
+            stopHeartbeat();
+            setStatus("Completed");
+            setIsRunning(false);
+            setActiveChannelInfo(null);
+            ws.close();
+          } catch (error: any) {
+            addLog(`Error during close/withdraw: ${error.message || error}`);
+          } finally {
+            setIsClosing(false);
           }
-
-          stopHeartbeat();
-          setStatus("Completed");
-          setIsRunning(false);
-          ws.close();
         }
       };
 
@@ -771,7 +804,24 @@ export default function App() {
                 border: "2px solid #1e7e34",
               }}
             >
-              {isResizing ? "Resizing..." : "Step 2: Resize Channel"}
+              {isResizing ? "Resizing..." : "Step 2: Resize"}
+            </button>
+
+            <button
+              onClick={handleCloseChannel}
+              disabled={isClosing}
+              style={{
+                padding: "15px 20px",
+                backgroundColor: isClosing ? "#ccc" : "#dc3545",
+                color: "white",
+                fontWeight: "bold",
+                borderRadius: "4px",
+                cursor: isClosing ? "not-allowed" : "pointer",
+                flex: 1,
+                border: "2px solid #a71d2a",
+              }}
+            >
+              {isClosing ? "Closing..." : "Step 3: Close"}
             </button>
           </div>
         )}
