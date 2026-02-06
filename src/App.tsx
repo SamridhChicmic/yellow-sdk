@@ -16,8 +16,8 @@ import {
   createTransferMessage,
 } from "@erc7824/nitrolite";
 import type { RPCAsset, RPCNetworkInfo } from "@erc7824/nitrolite";
-import { createPublicClient, createWalletClient, http, custom } from "viem";
-import { sepolia, baseSepolia } from "viem/chains";
+import { createPublicClient, createWalletClient, http, custom, parseUnits } from "viem";
+import { sepolia, baseSepolia, base } from "viem/chains";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import "./App.css";
 import { useState, useEffect, useRef } from "react";
@@ -41,6 +41,12 @@ const SUPPORTED_CHAINS = [
     chain: baseSepolia,
     defaultRpc: "https://sepolia.base.org",
   },
+  {
+    id: base.id,
+    name: "Base Mainnet (USDC)",
+    chain: base,
+    defaultRpc: "https://mainnet.base.org",
+  },
 ];
 
 export default function App() {
@@ -61,15 +67,25 @@ export default function App() {
   const [isDepositing, setIsDepositing] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
+  const [isClosingResizingChannel, setIsClosingResizingChannel] =
+    useState(false);
   const [isDepositDone, setIsDepositDone] = useState(false);
   const [appSessionId, setAppSessionId] = useState<string | null>(null);
   const [isCreatingAppSession, setIsCreatingAppSession] = useState(false);
   const [isClosingAppSession, setIsClosingAppSession] = useState(false);
   const [isFetchingChannels, setIsFetchingChannels] = useState(false);
   const [isTransferring, setIsTransferring] = useState(false);
+  const [isReadingCustodyBalance, setIsReadingCustodyBalance] = useState(false);
+  const [isWithdrawingCustodyBalance, setIsWithdrawingCustodyBalance] =
+    useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const heartbeatIntervalRef = useRef<any>(null);
+
+  const [isWsConnected, setIsWsConnected] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const isAuthenticatedRef = useRef(false);
+  const authParamsRef = useRef<any | null>(null);
 
   const sessionKeyRef = useRef<{
     privateKey: `0x${string}`;
@@ -151,7 +167,7 @@ export default function App() {
     const signer = createECDSAMessageSigner(pk);
     const message = await createGetConfigMessage(signer);
 
-    const ws = new WebSocket("wss://clearnet-sandbox.yellow.com/ws");
+    const ws = new WebSocket("wss://clearnet.yellow.com/ws");
 
     return new Promise((resolve, reject) => {
       ws.onopen = () => {
@@ -189,24 +205,31 @@ export default function App() {
     addLog("Manual Deposit Initiated...");
 
     try {
-      const depositAmount = 20n;
+      const depositAmount = parseUnits("0.1", USDC_DECIMALS);
       addLog(`Depositing ${depositAmount} units to Custody...`);
+      addLog(`Token <><><> ${token}}`);
+      try {
       const depositTx = await client.deposit(
         token as `0x${string}`,
-        depositAmount,
-      );
-      addLog(`✓ Deposit transaction sent: ${depositTx}`);
-      addLog("Waiting for deposit confirmation...");
-      await publicClient.waitForTransactionReceipt({ hash: depositTx });
-      addLog("✓ Deposit confirmed on-chain. You can now Resize.");
-      setIsDepositDone(true);
+          depositAmount,
+        );
+        console.log("Deposit transaction", depositTx);
+        addLog(`✓ Deposit transaction sent: ${depositTx}`);
+        addLog("Waiting for deposit confirmation...");
+        await publicClient.waitForTransactionReceipt({ hash: depositTx });
+        addLog("✓ Deposit confirmed on-chain. You can now Resize.");
+        setIsDepositDone(true);
+      } catch (error: any) {
+        console.log("Error during deposit", error);
+        addLog(`Error during deposit: ${error.message || error}`);
+      }
     } catch (error: any) {
       addLog(`Error during deposit: ${error.message || error}`);
     } finally {
       setIsDepositing(false);
     }
   };
-
+  const USDC_DECIMALS = 6;
   const handleResize = async () => {
     if (!activeChannelInfo || !account || !wsRef.current) return;
     const { id } = activeChannelInfo;
@@ -215,7 +238,7 @@ export default function App() {
     addLog("Manual Resize Initiated...");
 
     try {
-      const resizeAmount = 50000n;
+      const resizeAmount = 0.1;
       addLog(`Requesting resize for ${resizeAmount} units...`);
 
       if (!sessionKeyRef.current) throw new Error("Session key missing");
@@ -225,8 +248,8 @@ export default function App() {
 
       const resizeMsg = await createResizeChannelMessage(sessionSigner, {
         channel_id: id as `0x${string}`,
-        // allocate_amount: resizeAmount,
-        resize_amount: resizeAmount,
+        allocate_amount: - parseUnits(resizeAmount.toString(), USDC_DECIMALS),
+        resize_amount: parseUnits(resizeAmount.toString(), USDC_DECIMALS),
         funds_destination: account,
       });
 
@@ -298,6 +321,35 @@ export default function App() {
     }
   };
 
+  const handleCloseResizingChannel = async () => {
+    if (!wsRef.current || !account) return;
+    addLog('Fetching channels to find any with status "resizing"...');
+    setIsClosingResizingChannel(true);
+
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+
+      const getChannelsMsg = await createGetChannelsMessage(
+        sessionSigner,
+        account,
+      );
+
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(getChannelsMsg);
+        addLog("Sent get_channels message (for closing resizing channel).");
+      }
+    } catch (error: any) {
+      addLog(
+        `Error preparing to close resizing channel: ${
+          error.message || error
+        }`,
+      );
+    }
+  };
+
   const handleCreateAppSession = async () => {
     if (!wsRef.current || !account) return;
     setIsCreatingAppSession(true);
@@ -310,7 +362,7 @@ export default function App() {
 
       const participantA = account;
       const participantB =
-        "0xc7E6827ad9DA2c89188fAEd836F9285E6bFdCCCC" as `0x${string}`;
+        "0x5288dD861713219b9A4941484DE0CD53fA3C0334" as `0x${string}`;
 
       const appDefinition = {
         protocol: "nitroliterpc" as any,
@@ -325,12 +377,12 @@ export default function App() {
       const allocations = [
         {
           participant: participantA,
-          asset: "ytest.usd",
-          amount: "100",
+          asset: "usdc",
+          amount: "1",
         },
         {
           participant: participantB,
-          asset: "ytest.usd",
+          asset: "usdc",
           amount: "0",
         },
       ];
@@ -367,12 +419,12 @@ export default function App() {
       const allocations = [
         {
           participant: participantA,
-          asset: "ytest.usd",
+          asset: "usdc",
           amount: "0",
         },
         {
           participant: participantB,
-          asset: "ytest.usd",
+          asset: "usdc",
           amount: "100",
         },
       ];
@@ -409,21 +461,118 @@ export default function App() {
         destination: "0x5288dD861713219b9A4941484DE0CD53fA3C0334",
         allocations: [
           {
-            asset: "ytest.usd",
-            amount: "1",
+            asset: "usdc",
+            amount: "0.1",
           },
         ],
       });
 
       console.log("Transfer payload", transferPayload);
 
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(transferPayload);
-        addLog("Sent transfer message.");
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        addLog("Error: WebSocket not connected. Please click Start Flow first.");
+        return;
       }
+
+      ws.send(transferPayload);
+      addLog("Sent transfer message.");
     } catch (error: any) {
       addLog(`Error during transfer: ${error.message || error}`);
       setIsTransferring(false);
+    }
+  };
+
+  const handleReadCustodyBalance = async () => {
+    if (!activeChannelInfo || !account) {
+      addLog("Error: No active channel or wallet not connected.");
+      return;
+    }
+
+    const { client, publicClient, token } = activeChannelInfo;
+
+    setIsReadingCustodyBalance(true);
+    addLog("Reading custody balance from Custody contract...");
+
+    try {
+      const result = (await publicClient.readContract({
+        address: client.addresses.custody,
+        abi: [
+          {
+            type: "function",
+            name: "getAccountsBalances",
+            inputs: [
+              { name: "users", type: "address[]" },
+              { name: "tokens", type: "address[]" },
+            ],
+            outputs: [{ type: "uint256[]" }],
+            stateMutability: "view",
+          },
+        ] as const,
+        functionName: "getAccountsBalances",
+        args: [[account], [token as `0x${string}`]],
+      })) as bigint[];
+      console.log("Result <><><>>", result);
+      const balance = result[0];
+      addLog(
+        `Custody balance for ${account} (token ${token}): ${balance.toString()}`,
+      );
+    } catch (error: any) {
+      addLog(`Error reading custody balance: ${error.message || error}`);
+    } finally {
+      setIsReadingCustodyBalance(false);
+    }
+  };
+
+  const handleWithdrawCustodyBalance = async () => {
+    if (!activeChannelInfo || !account) {
+      addLog("Error: No active channel or wallet not connected.");
+      return;
+    }
+
+    const { client, publicClient, token } = activeChannelInfo;
+
+    setIsWithdrawingCustodyBalance(true);
+    addLog("Withdrawing full custody balance from Custody contract...");
+
+    try {
+      const result = (await publicClient.readContract({
+        address: client.addresses.custody,
+        abi: [
+          {
+            type: "function",
+            name: "getAccountsBalances",
+            inputs: [
+              { name: "users", type: "address[]" },
+              { name: "tokens", type: "address[]" },
+            ],
+            outputs: [{ type: "uint256[]" }],
+            stateMutability: "view",
+          },
+        ] as const,
+        functionName: "getAccountsBalances",
+        args: [[account], [token as `0x${string}`]],
+      })) as bigint[];
+
+      const balance = 100000n;//result[0];
+      addLog(
+        `Current custody balance for ${account} (token ${token}): ${balance.toString()}`,
+      );
+
+      if (balance > 0n) {
+        addLog(`Withdrawing ${balance.toString()} of ${token} from custody...`);
+        const withdrawalTx = await client.withdrawal(
+          token as `0x${string}`,
+          balance,
+        );
+        addLog(`✓ Funds withdrawn. Tx hash: ${withdrawalTx}`);
+      } else {
+        addLog("No funds to withdraw from custody.");
+      }
+    } catch (error: any) {
+      addLog(`Error withdrawing custody balance: ${error.message || error}`);
+    } finally {
+      setIsWithdrawingCustodyBalance(false);
     }
   };
 
@@ -439,6 +588,9 @@ export default function App() {
     addLog("Starting flow...");
     setActiveChannelInfo(null);
     setIsDepositDone(false);
+    setIsWsConnected(false);
+    setIsAuthenticated(false);
+    isAuthenticatedRef.current = false;
 
     try {
       const chainInfo = SUPPORTED_CHAINS.find((c) => c.id === selectedChainId)!;
@@ -488,7 +640,7 @@ export default function App() {
       );
 
       const addresses = {
-        custody: "0x019B65A265EB3363822f2752141b3dF16131b262",
+        custody: "0x490fb189DdE3a01B00be9BA5F41e3447FbC838b6",
         adjudicator: "0x7c7ccbc98469190849BCC6c926307794fDfB11F2",
       };
 
@@ -504,32 +656,26 @@ export default function App() {
       addLog("✓ Nitrolite Client initialized");
 
       if (wsRef.current) wsRef.current.close();
-      const ws = new WebSocket("wss://clearnet-sandbox.yellow.com/ws");
+      const ws = new WebSocket("wss://clearnet.yellow.com/ws");
       wsRef.current = ws;
+      setIsWsConnected(false);
 
       const authParams = {
         session_key: sessionKeyRef.current.address,
         allowances: [
           {
-            asset: "ytest.usd",
-            amount: "1000000000",
+            asset: "usdc",
+            amount: "1",
           },
         ],
         expires_at: BigInt(Math.floor(Date.now() / 1000) + 3600),
         scope: "test.app",
       };
-
-      const authRequestMsg = await createAuthRequestMessage({
-        address: account,
-        application: "Test app",
-        ...authParams,
-      });
-
-      let isAuthenticated = false;
+      authParamsRef.current = authParams;
 
       ws.onopen = () => {
-        ws.send(authRequestMsg);
-        addLog("Sent auth_request (Requesting Wallet Signature...)");
+        addLog("WebSocket connected.");
+        setIsWsConnected(true);
         startHeartbeat();
       };
 
@@ -549,9 +695,15 @@ export default function App() {
         }
 
         if (response.res && response.res[1] === "auth_challenge") {
-          if (isAuthenticated) return;
+          if (isAuthenticatedRef.current) return;
           addLog("Received auth_challenge");
           const challenge = response.res[2].challenge_message;
+
+          const authParams = authParamsRef.current;
+          if (!authParams) {
+            addLog("Error: Missing auth params. Please click Authenticate again.");
+            return;
+          }
 
           const signer = createEIP712AuthMessageSigner(
             walletClientState,
@@ -569,7 +721,8 @@ export default function App() {
 
         if (response.res && response.res[1] === "auth_verify") {
           addLog("✓ Authenticated successfully");
-          isAuthenticated = true;
+          isAuthenticatedRef.current = true;
+          setIsAuthenticated(true);
 
           const ledgerMsg = await createGetLedgerBalancesMessage(
             sessionSigner,
@@ -579,7 +732,13 @@ export default function App() {
           ws.send(ledgerMsg);
           addLog("Sent get_ledger_balances request...");
         }
-
+        if(response.res && response.res[1] === "get_ledger_balances") {
+          const ledgerBalances = response.res[2].ledger_balances;
+          console.log("Ledger Balances <><><>>", ledgerBalances);
+          const bal = ledgerBalances.find((b: any) => b.asset === "usdc");
+          addLog(`Ledger Balances <><><>> ${bal?.amount}`);
+          console.log("Ledger Balances <><><>>", ledgerBalances);
+        }
         if (response.res && response.res[1] === "channels") {
           const channels = response.res[2].channels;
           const openChannel = channels.find(
@@ -588,8 +747,9 @@ export default function App() {
           );
 
           const supportedAsset = config.assets?.find(
-            (a: any) => a.chain_id === selectedChainId,
+            (a: any) => a.chain_id === selectedChainId && a.symbol === "usdc",
           );
+          console.log("Supported Asset <><><>>", supportedAsset);
           const token = supportedAsset
             ? (supportedAsset as any).token
             : selectedChainId === sepolia.id
@@ -764,6 +924,7 @@ export default function App() {
                   token: a.token,
                   amount: BigInt(a.amount),
                 })),
+                // allocations: [],
                 channelId: channel_id,
                 serverSignature: server_signature,
               },
@@ -792,15 +953,16 @@ export default function App() {
               functionName: "getAccountsBalances",
               args: [[account], [token as `0x${string}`]],
             })) as bigint[];
-            const balance = result[0];
-
+            const balance = 99882n;
+            console.log("Balance <><><>>", balance);
+            console.log("Result <><><>>", result);
             if (balance > 0n) {
               addLog(`Withdrawing ${balance} of ${token}...`);
-              const withdrawalTx = await client.withdrawal(
-                token as `0x${string}`,
-                balance,
-              );
-              addLog(`✓ Funds withdrawn: ${withdrawalTx}`);
+              // const withdrawalTx = await client.withdrawal(
+              //   token as `0x${string}`,
+              //   balance,
+              // );
+              // addLog(`✓ Funds withdrawn: ${withdrawalTx}`);
             } else {
               addLog("No funds to withdraw.");
             }
@@ -812,6 +974,7 @@ export default function App() {
             ws.close();
           } catch (error: any) {
             addLog(`Error during close/withdraw: ${error.message || error}`);
+            console.log("Error <><><>>", error);
           } finally {
             setIsClosing(false);
           }
@@ -821,15 +984,63 @@ export default function App() {
           addLog("✓ Received channels information.");
           const channelsList = response.res[2].channels;
           console.log("channelsList", response.res[2]);
+
           if (channelsList && channelsList.length > 0) {
             channelsList.forEach((channel: any, index: number) => {
               addLog(
                 `- Channel ${index + 1}: ${channel.channel_id} (${channel.status})`,
               );
             });
+
+            // If user clicked "Close Resizing Channel", close all channels in "resizing" status
+            if (true) {
+              const resizingChannels = channelsList.filter(
+                (channel: any) =>
+                  channel.status === "resizing" &&
+                  Number(channel.chain_id) === selectedChainId,
+              );
+              console.log("Resizing Channels <><><>>", resizingChannels);
+              if (resizingChannels.length > 0) {
+                console.log("Resizing Channels <><><>>", resizingChannels);
+                for (const resizingChannel of resizingChannels) {
+                  addLog(
+                    `Sending close request for resizing channel: ${resizingChannel.channel_id}`,
+                  );
+                  try {
+                    const closeMsg = await createCloseChannelMessage(
+                      sessionSigner,
+                      resizingChannel.channel_id as `0x${string}`,
+                      account,
+                    );
+
+                    if (ws.readyState === WebSocket.OPEN) {
+                      ws.send(closeMsg);
+                      addLog(
+                        `Sent close_channel message for resizing channel: ${resizingChannel.channel_id}`,
+                      );
+                    } else {
+                      addLog(
+                        "Error: WebSocket connection lost before sending close_channel.",
+                      );
+                    }
+                  } catch (error: any) {
+                    addLog(
+                      `Error while closing resizing channel ${resizingChannel.channel_id}: ${
+                        error.message || error
+                      }`,
+                    );
+                  }
+                }
+              } else {
+                addLog('No channel with status "resizing" found to close.');
+              }
+
+              setIsClosingResizingChannel(false);
+            }
           } else {
             addLog("No active channels found.");
           }
+
           setIsFetchingChannels(false);
         }
 
@@ -855,12 +1066,14 @@ export default function App() {
         addLog(`WebSocket Error: ${JSON.stringify(error)}`);
         stopHeartbeat();
         ws.close();
+        setIsWsConnected(false);
         setIsRunning(false);
         setStatus("Error");
       };
 
       ws.onclose = () => {
         stopHeartbeat();
+        setIsWsConnected(false);
         addLog("WebSocket connection closed.");
       };
     } catch (error: any) {
@@ -868,6 +1081,60 @@ export default function App() {
 
       setIsRunning(false);
       setStatus("Error");
+    }
+  };
+
+  const handleAuthenticate = async () => {
+    if (!account || !walletClientState) {
+      addLog("Error: Wallet not connected");
+      return;
+    }
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      addLog("Error: WebSocket not connected. Please click Start Flow first.");
+      return;
+    }
+    if (!sessionKeyRef.current) {
+      addLog("Error: Session key not initialized. Please click Start Flow first.");
+      return;
+    }
+    if (isAuthenticatedRef.current) {
+      addLog("Already authenticated.");
+      return;
+    }
+
+    try {
+      const authParams =
+        authParamsRef.current ||
+        {
+          session_key: sessionKeyRef.current.address,
+          allowances: [
+            {
+              asset: "usdc",
+              amount: "1000000000",
+            },
+          ],
+          expires_at: BigInt(Math.floor(Date.now() / 1000) + 3600),
+          scope: "test.app",
+        };
+
+      authParamsRef.current = authParams;
+
+      const authRequestMsg = await createAuthRequestMessage({
+        address: account,
+        application: "Test app",
+        ...authParams,
+      });
+
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        addLog("Error: WebSocket not connected. Please click Start Flow first.");
+        return;
+      }
+
+      ws.send(authRequestMsg);
+      addLog("Sent auth_request (Requesting Wallet Signature...)");
+    } catch (error: any) {
+      addLog(`Error sending auth request: ${error.message || error}`);
     }
   };
 
@@ -973,7 +1240,37 @@ export default function App() {
               transition: "background-color 0.2s",
             }}
           >
-            {isRunning ? "Running..." : "🚀 Start Flow"}
+            {isRunning ? "Running..." : "🚀 Start Flow (Connect WS)"}
+          </button>
+
+          <button
+            onClick={handleAuthenticate}
+            disabled={
+              !account ||
+              !isWsConnected ||
+              !wsRef.current ||
+              wsRef.current.readyState !== WebSocket.OPEN ||
+              isAuthenticated
+            }
+            style={{
+              padding: "12px",
+              backgroundColor:
+                !account || !isWsConnected || isAuthenticated
+                  ? "#ccc"
+                  : "#20c997",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor:
+                !account || !isWsConnected || isAuthenticated
+                  ? "not-allowed"
+                  : "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+              transition: "background-color 0.2s",
+            }}
+          >
+            {isAuthenticated ? "✓ Authenticated" : "Authenticate"}
           </button>
 
           {activeChannelInfo && (
@@ -1020,6 +1317,46 @@ export default function App() {
               </button>
 
               <button
+                onClick={handleReadCustodyBalance}
+                disabled={isReadingCustodyBalance}
+                style={{
+                  padding: "10px",
+                  backgroundColor: isReadingCustodyBalance ? "#ccc" : "#17a2b8",
+                  color: "white",
+                  fontWeight: "bold",
+                  borderRadius: "4px",
+                  cursor: isReadingCustodyBalance ? "not-allowed" : "pointer",
+                  border: "1px solid #117a8b",
+                }}
+              >
+                {isReadingCustodyBalance
+                  ? "Reading Custody Balance..."
+                  : "Read Custody Balance"}
+              </button>
+
+              <button
+                onClick={handleWithdrawCustodyBalance}
+                disabled={isWithdrawingCustodyBalance}
+                style={{
+                  padding: "10px",
+                  backgroundColor: isWithdrawingCustodyBalance
+                    ? "#ccc"
+                    : "#6c757d",
+                  color: "white",
+                  fontWeight: "bold",
+                  borderRadius: "4px",
+                  cursor: isWithdrawingCustodyBalance
+                    ? "not-allowed"
+                    : "pointer",
+                  border: "1px solid #545b62",
+                }}
+              >
+                {isWithdrawingCustodyBalance
+                  ? "Withdrawing Custody Balance..."
+                  : "Withdraw Custody Balance"}
+              </button>
+
+              <button
                 onClick={handleResize}
                 disabled={isResizing}
                 style={{
@@ -1033,6 +1370,24 @@ export default function App() {
                 }}
               >
                 {isResizing ? "Resizing..." : "Resize Channel"}
+              </button>
+
+              <button
+                onClick={handleCloseResizingChannel}
+                disabled={isClosing}
+                style={{
+                  padding: "10px",
+                  backgroundColor: isClosing ? "#ccc" : "#ff5722",
+                  color: "white",
+                  fontWeight: "bold",
+                  borderRadius: "4px",
+                  cursor: isClosing ? "not-allowed" : "pointer",
+                  border: "1px solid #e64a19",
+                }}
+              >
+                {isClosing
+                  ? "Closing Resizing Channel..."
+                  : "Close Resizing Channel"}
               </button>
 
               <button
