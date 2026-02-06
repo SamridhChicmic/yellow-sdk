@@ -10,6 +10,10 @@ import {
   createGetLedgerBalancesMessage,
   createAuthRequestMessage,
   createCloseChannelMessage,
+  createGetChannelsMessage,
+  createAppSessionMessage,
+  createCloseAppSessionMessage,
+  createTransferMessage,
 } from "@erc7824/nitrolite";
 import type { RPCAsset, RPCNetworkInfo } from "@erc7824/nitrolite";
 import { createPublicClient, createWalletClient, http, custom } from "viem";
@@ -58,6 +62,11 @@ export default function App() {
   const [isResizing, setIsResizing] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
   const [isDepositDone, setIsDepositDone] = useState(false);
+  const [appSessionId, setAppSessionId] = useState<string | null>(null);
+  const [isCreatingAppSession, setIsCreatingAppSession] = useState(false);
+  const [isClosingAppSession, setIsClosingAppSession] = useState(false);
+  const [isFetchingChannels, setIsFetchingChannels] = useState(false);
+  const [isTransferring, setIsTransferring] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const heartbeatIntervalRef = useRef<any>(null);
@@ -206,7 +215,7 @@ export default function App() {
     addLog("Manual Resize Initiated...");
 
     try {
-      const resizeAmount = 20000000n;
+      const resizeAmount = 50000n;
       addLog(`Requesting resize for ${resizeAmount} units...`);
 
       if (!sessionKeyRef.current) throw new Error("Session key missing");
@@ -216,8 +225,9 @@ export default function App() {
 
       const resizeMsg = await createResizeChannelMessage(sessionSigner, {
         channel_id: id as `0x${string}`,
-        allocate_amount: resizeAmount,
-        funds_destination: "0xc7E6827ad9DA2c89188fAEd836F9285E6bFdCCCC", // "0x5288dD861713219b9A4941484DE0CD53fA3C0334",
+        // allocate_amount: resizeAmount,
+        resize_amount: resizeAmount,
+        funds_destination: account,
       });
 
       if (wsRef.current.readyState === WebSocket.OPEN) {
@@ -262,6 +272,158 @@ export default function App() {
     } catch (error: any) {
       addLog(`Error during channel close: ${error.message || error}`);
       setIsClosing(false);
+    }
+  };
+
+  const handleGetChannels = async () => {
+    if (!wsRef.current || !account) return;
+    setIsFetchingChannels(true);
+    addLog("Fetching channels...");
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+      const getChannelsMsg = await createGetChannelsMessage(
+        sessionSigner,
+        account,
+      );
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(getChannelsMsg);
+        addLog("Sent get_channels message.");
+      }
+    } catch (error: any) {
+      addLog(`Error fetching channels: ${error.message || error}`);
+      setIsFetchingChannels(false);
+    }
+  };
+
+  const handleCreateAppSession = async () => {
+    if (!wsRef.current || !account) return;
+    setIsCreatingAppSession(true);
+    addLog("Creating App Session...");
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+
+      const participantA = account;
+      const participantB =
+        "0xc7E6827ad9DA2c89188fAEd836F9285E6bFdCCCC" as `0x${string}`;
+
+      const appDefinition = {
+        protocol: "nitroliterpc" as any,
+        application: "Test app",
+        participants: [participantA, participantB],
+        weights: [100, 0],
+        quorum: 100,
+        challenge: 0,
+        nonce: Date.now(),
+      };
+
+      const allocations = [
+        {
+          participant: participantA,
+          asset: "ytest.usd",
+          amount: "100",
+        },
+        {
+          participant: participantB,
+          asset: "ytest.usd",
+          amount: "0",
+        },
+      ];
+
+      const createAppSessionMsg = await createAppSessionMessage(sessionSigner, {
+        definition: appDefinition,
+        allocations: allocations,
+      });
+
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(createAppSessionMsg);
+        addLog("Sent create_app_session message.");
+      }
+    } catch (error: any) {
+      addLog(`Error creating app session: ${error.message || error}`);
+      setIsCreatingAppSession(false);
+    }
+  };
+
+  const handleCloseAppSession = async () => {
+    if (!wsRef.current || !account || !appSessionId) return;
+    setIsClosingAppSession(true);
+    addLog("Closing App Session...");
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+
+      const participantA = account;
+      const participantB =
+        "0xc7E6827ad9DA2c89188fAEd836F9285E6bFdCCCC" as `0x${string}`;
+
+      const allocations = [
+        {
+          participant: participantA,
+          asset: "ytest.usd",
+          amount: "0",
+        },
+        {
+          participant: participantB,
+          asset: "ytest.usd",
+          amount: "100",
+        },
+      ];
+
+      const closeAppSessionMsg = await createCloseAppSessionMessage(
+        sessionSigner,
+        {
+          app_session_id: appSessionId as `0x${string}`,
+          allocations: allocations,
+        },
+      );
+
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(closeAppSessionMsg);
+        addLog("Sent close_app_session message.");
+      }
+    } catch (error: any) {
+      addLog(`Error closing app session: ${error.message || error}`);
+      setIsClosingAppSession(false);
+    }
+  };
+
+  const handleTransfer = async () => {
+    // if (!wsRef.current || !account || !appSessionId) return;
+    // setIsTransferring(true);
+    addLog("Initiating Transfer...");
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+
+      const transferPayload = await createTransferMessage(sessionSigner, {
+        destination: "0x5288dD861713219b9A4941484DE0CD53fA3C0334",
+        allocations: [
+          {
+            asset: "ytest.usd",
+            amount: "1",
+          },
+        ],
+      });
+
+      console.log("Transfer payload", transferPayload);
+
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(transferPayload);
+        addLog("Sent transfer message.");
+      }
+    } catch (error: any) {
+      addLog(`Error during transfer: ${error.message || error}`);
+      setIsTransferring(false);
     }
   };
 
@@ -569,11 +731,17 @@ export default function App() {
           }
 
           addLog("Submitting resize to L1 (Approving Wallet Transaction)...");
+          const previousState = await client.getChannelData(
+            channel_id as `0x${string}`,
+          );
+          console.log("Previous State:", previousState);
+          console.log("Resize State:", resizeState);
+
           const { txHash } = await client.resizeChannel({
             resizeState,
-            proofStates: [],
+            proofStates: [previousState.lastValidState as any],
           });
-
+          console.log("Transaction Hash:", txHash);
           addLog(`✓ Channel resized on-chain: ${txHash}`);
           addLog(
             "Manual Action Required: Please click Step 3: Close Channel when ready.",
@@ -648,6 +816,39 @@ export default function App() {
             setIsClosing(false);
           }
         }
+
+        if (response.res && response.res[1] === "get_channels") {
+          addLog("✓ Received channels information.");
+          const channelsList = response.res[2].channels;
+          console.log("channelsList", response.res[2]);
+          if (channelsList && channelsList.length > 0) {
+            channelsList.forEach((channel: any, index: number) => {
+              addLog(
+                `- Channel ${index + 1}: ${channel.channel_id} (${channel.status})`,
+              );
+            });
+          } else {
+            addLog("No active channels found.");
+          }
+          setIsFetchingChannels(false);
+        }
+
+        if (response.res && response.res[1] === "create_app_session") {
+          const appSessionId = response.res[2]?.[0]?.app_session_id;
+          if (appSessionId) {
+            setAppSessionId(appSessionId);
+            addLog(`✓ App Session created: ${appSessionId}`);
+          } else {
+            addLog("Error: App session ID not found in response.");
+          }
+          setIsCreatingAppSession(false);
+        }
+
+        if (response.res && response.res[1] === "close_app_session") {
+          addLog("✓ App Session closed successfully.");
+          setAppSessionId(null);
+          setIsClosingAppSession(false);
+        }
       };
 
       ws.onerror = (error) => {
@@ -664,6 +865,7 @@ export default function App() {
       };
     } catch (error: any) {
       addLog(`Error: ${error.message || error}`);
+
       setIsRunning(false);
       setStatus("Error");
     }
@@ -748,81 +950,208 @@ export default function App() {
           ))}
         </select>
 
-        <button
-          onClick={runFlow}
-          disabled={isRunning || !account}
+        <div
           style={{
-            padding: "10px 20px",
-            backgroundColor: isRunning || !account ? "#ccc" : "#007bff",
-            color: "white",
-            border: "none",
-            borderRadius: "4px",
-            cursor: isRunning || !account ? "not-allowed" : "pointer",
-            marginTop: "10px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+            marginTop: "15px",
           }}
         >
-          {isRunning ? "Running..." : "Start Flow"}
-        </button>
+          <button
+            onClick={runFlow}
+            disabled={isRunning || !account}
+            style={{
+              padding: "12px",
+              backgroundColor: isRunning || !account ? "#ccc" : "#007bff",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: isRunning || !account ? "not-allowed" : "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+              transition: "background-color 0.2s",
+            }}
+          >
+            {isRunning ? "Running..." : "🚀 Start Flow"}
+          </button>
 
-        {activeChannelInfo && (
-          <div style={{ display: "flex", gap: "10px", marginTop: "5px" }}>
-            <button
-              onClick={handleDeposit}
-              disabled={isDepositing || isDepositDone}
+          {activeChannelInfo && (
+            <div
               style={{
-                padding: "15px 20px",
-                backgroundColor:
-                  isDepositing || isDepositDone ? "#ccc" : "#ffc107",
-                color: "black",
-                fontWeight: "bold",
-                borderRadius: "4px",
-                cursor:
-                  isDepositing || isDepositDone ? "not-allowed" : "pointer",
-                flex: 1,
-                border: "2px solid #e0a800",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                padding: "10px",
+                backgroundColor: "#f0f0f0",
+                borderRadius: "6px",
               }}
             >
-              {isDepositing
-                ? "Depositing..."
-                : isDepositDone
-                  ? "✓ Assets Deposited"
-                  : "Step 1: Deposit Assets"}
-            </button>
+              <div
+                style={{
+                  fontSize: "12px",
+                  fontWeight: "bold",
+                  color: "#666",
+                  marginBottom: "4px",
+                }}
+              >
+                Manage Channel:
+              </div>
+              <button
+                onClick={handleDeposit}
+                disabled={isDepositing || isDepositDone}
+                style={{
+                  padding: "10px",
+                  backgroundColor:
+                    isDepositing || isDepositDone ? "#ccc" : "#ffc107",
+                  color: "black",
+                  fontWeight: "bold",
+                  borderRadius: "4px",
+                  cursor:
+                    isDepositing || isDepositDone ? "not-allowed" : "pointer",
+                  border: "1px solid #e0a800",
+                }}
+              >
+                {isDepositing
+                  ? "Depositing..."
+                  : isDepositDone
+                    ? "✓ Assets Deposited"
+                    : "Deposit Assets"}
+              </button>
 
-            <button
-              onClick={handleResize}
-              disabled={isResizing}
+              <button
+                onClick={handleResize}
+                disabled={isResizing}
+                style={{
+                  padding: "10px",
+                  backgroundColor: isResizing ? "#ccc" : "#28a745",
+                  color: "white",
+                  fontWeight: "bold",
+                  borderRadius: "4px",
+                  cursor: isResizing ? "not-allowed" : "pointer",
+                  border: "1px solid #1e7e34",
+                }}
+              >
+                {isResizing ? "Resizing..." : "Resize Channel"}
+              </button>
+
+              <button
+                onClick={handleCloseChannel}
+                disabled={isClosing}
+                style={{
+                  padding: "10px",
+                  backgroundColor: isClosing ? "#ccc" : "#dc3545",
+                  color: "white",
+                  fontWeight: "bold",
+                  borderRadius: "4px",
+                  cursor: isClosing ? "not-allowed" : "pointer",
+                  border: "1px solid #a71d2a",
+                }}
+              >
+                {isClosing ? "Closing..." : "Close Channel"}
+              </button>
+            </div>
+          )}
+
+          <div style={{ borderTop: "1px solid #eee", margin: "5px 0" }} />
+
+          <button
+            onClick={handleGetChannels}
+            disabled={!account || !wsRef.current || isFetchingChannels}
+            style={{
+              padding: "12px",
+              backgroundColor: "#17a2b8",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+            }}
+          >
+            {isFetchingChannels ? "Fetching..." : "Get Channels"}
+          </button>
+
+          <button
+            onClick={handleCreateAppSession}
+            disabled={
+              !account ||
+              !wsRef.current ||
+              isCreatingAppSession ||
+              !!appSessionId
+            }
+            style={{
+              padding: "12px",
+              backgroundColor: "#6610f2",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+            }}
+          >
+            {isCreatingAppSession ? "Creating..." : "Create App Session"}
+          </button>
+
+          <button
+            onClick={handleTransfer}
+            // disabled={!appSessionId || isTransferring}
+            style={{
+              padding: "12px",
+              backgroundColor: "#fd7e14",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+            }}
+          >
+            {isTransferring ? "Transferring..." : "Transfer Funds"}
+          </button>
+
+          <button
+            onClick={handleCloseAppSession}
+            disabled={!appSessionId || isClosingAppSession}
+            style={{
+              padding: "12px",
+              backgroundColor: "#e83e8c",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+            }}
+          >
+            {isClosingAppSession ? "Closing..." : "Close App Session"}
+          </button>
+        </div>
+
+        {appSessionId && (
+          <div
+            style={{
+              marginTop: "12px",
+              padding: "10px",
+              backgroundColor: "#fff3cd",
+              borderRadius: "4px",
+              border: "1px solid #ffeeba",
+              color: "#856404",
+            }}
+          >
+            <div style={{ fontSize: "12px", fontWeight: "bold" }}>
+              Active Session ID:
+            </div>
+            <div
               style={{
-                padding: "15px 20px",
-                backgroundColor: isResizing ? "#ccc" : "#28a745",
-                color: "white",
-                fontWeight: "bold",
-                border: "none",
-                borderRadius: "4px",
-                cursor: isResizing ? "not-allowed" : "pointer",
-                flex: 1,
-                border: "2px solid #1e7e34",
+                fontFamily: "monospace",
+                fontSize: "10px",
+                wordBreak: "break-all",
               }}
             >
-              {isResizing ? "Resizing..." : "Step 2: Resize"}
-            </button>
-
-            <button
-              onClick={handleCloseChannel}
-              disabled={isClosing}
-              style={{
-                padding: "15px 20px",
-                backgroundColor: isClosing ? "#ccc" : "#dc3545",
-                color: "white",
-                fontWeight: "bold",
-                borderRadius: "4px",
-                cursor: isClosing ? "not-allowed" : "pointer",
-                flex: 1,
-                border: "2px solid #a71d2a",
-              }}
-            >
-              {isClosing ? "Closing..." : "Step 3: Close"}
-            </button>
+              {appSessionId}
+            </div>
           </div>
         )}
       </div>
