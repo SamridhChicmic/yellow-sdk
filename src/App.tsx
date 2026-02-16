@@ -14,9 +14,16 @@ import {
   createAppSessionMessage,
   createCloseAppSessionMessage,
   createTransferMessage,
+  createGetLedgerTransactionsMessage,
 } from "@erc7824/nitrolite";
 import type { RPCAsset, RPCNetworkInfo } from "@erc7824/nitrolite";
-import { createPublicClient, createWalletClient, http, custom, parseUnits } from "viem";
+import {
+  createPublicClient,
+  createWalletClient,
+  http,
+  custom,
+  parseUnits,
+} from "viem";
 import { sepolia, baseSepolia, base } from "viem/chains";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import "./App.css";
@@ -74,6 +81,7 @@ export default function App() {
   const [isCreatingAppSession, setIsCreatingAppSession] = useState(false);
   const [isClosingAppSession, setIsClosingAppSession] = useState(false);
   const [isFetchingChannels, setIsFetchingChannels] = useState(false);
+  const [isFetchingLedgerTransactions, setIsFetchingLedgerTransactions] = useState(false);
   const [isTransferring, setIsTransferring] = useState(false);
   const [isReadingCustodyBalance, setIsReadingCustodyBalance] = useState(false);
   const [isWithdrawingCustodyBalance, setIsWithdrawingCustodyBalance] =
@@ -209,8 +217,8 @@ export default function App() {
       addLog(`Depositing ${depositAmount} units to Custody...`);
       addLog(`Token <><><> ${token}}`);
       try {
-      const depositTx = await client.deposit(
-        token as `0x${string}`,
+        const depositTx = await client.deposit(
+          token as `0x${string}`,
           depositAmount,
         );
         console.log("Deposit transaction", depositTx);
@@ -248,7 +256,7 @@ export default function App() {
 
       const resizeMsg = await createResizeChannelMessage(sessionSigner, {
         channel_id: id as `0x${string}`,
-        allocate_amount: - parseUnits(resizeAmount.toString(), USDC_DECIMALS),
+        // allocate_amount: parseUnits(resizeAmount.toString(), USDC_DECIMALS),
         resize_amount: parseUnits(resizeAmount.toString(), USDC_DECIMALS),
         funds_destination: account,
       });
@@ -321,6 +329,29 @@ export default function App() {
     }
   };
 
+  const handleGetLedgerTransactions = async () => {
+    if (!wsRef.current || !account) return;
+    setIsFetchingLedgerTransactions(true);
+    addLog("Fetching ledger transactions...");
+    try {
+      if (!sessionKeyRef.current) throw new Error("Session key missing");
+      const sessionSigner = createECDSAMessageSigner(
+        sessionKeyRef.current.privateKey,
+      );
+      const getLedgerTransactionsMsg = await createGetLedgerTransactionsMessage(
+        sessionSigner,
+        account,
+      );
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(getLedgerTransactionsMsg);
+        addLog("Sent get_ledger_transactions message.");
+      }
+    } catch (error: any) {
+      addLog(`Error fetching ledger transactions: ${error.message || error}`);
+      setIsFetchingLedgerTransactions(false);
+    }
+  };
+
   const handleCloseResizingChannel = async () => {
     if (!wsRef.current || !account) return;
     addLog('Fetching channels to find any with status "resizing"...');
@@ -343,9 +374,7 @@ export default function App() {
       }
     } catch (error: any) {
       addLog(
-        `Error preparing to close resizing channel: ${
-          error.message || error
-        }`,
+        `Error preparing to close resizing channel: ${error.message || error}`,
       );
     }
   };
@@ -458,7 +487,7 @@ export default function App() {
       );
 
       const transferPayload = await createTransferMessage(sessionSigner, {
-        destination: "0x5288dD861713219b9A4941484DE0CD53fA3C0334",
+        destination: "0x5288dD861713219b9A4941484DE0CD53fA3C0334",//"0xf00c9c07320c64eC6567e20cBbc857af7E0468a7", //"0x5288dD861713219b9A4941484DE0CD53fA3C0334",
         allocations: [
           {
             asset: "usdc",
@@ -471,7 +500,9 @@ export default function App() {
 
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-        addLog("Error: WebSocket not connected. Please click Start Flow first.");
+        addLog(
+          "Error: WebSocket not connected. Please click Start Flow first.",
+        );
         return;
       }
 
@@ -510,12 +541,12 @@ export default function App() {
           },
         ] as const,
         functionName: "getAccountsBalances",
-        args: [[account], [token as `0x${string}`]],
+        args: [[client.account.address], [token as `0x${string}`]],
       })) as bigint[];
       console.log("Result <><><>>", result);
       const balance = result[0];
       addLog(
-        `Custody balance for ${account} (token ${token}): ${balance.toString()}`,
+        `address ${client.addresses.custody} Custody balance for ${client.account.address} (token ${token}): ${balance.toString()}`,
       );
     } catch (error: any) {
       addLog(`Error reading custody balance: ${error.message || error}`);
@@ -554,22 +585,26 @@ export default function App() {
         args: [[account], [token as `0x${string}`]],
       })) as bigint[];
 
-      const balance = 100000n;//result[0];
+      const balance = result[0];
       addLog(
-        `Current custody balance for ${account} (token ${token}): ${balance.toString()}`,
+        `Current custody balance for ${client.account.address} (token ${token}): ${balance.toString()}`,
       );
 
-      if (balance > 0n) {
+      if (true) {
         addLog(`Withdrawing ${balance.toString()} of ${token} from custody...`);
+        const amount = await client.getAccountBalance(token as `0x${string}`);
+        console.log("Amount <><><>>", amount);
         const withdrawalTx = await client.withdrawal(
           token as `0x${string}`,
           balance,
         );
+        console.log("Withdrawal transaction", withdrawalTx);
         addLog(`✓ Funds withdrawn. Tx hash: ${withdrawalTx}`);
       } else {
         addLog("No funds to withdraw from custody.");
       }
     } catch (error: any) {
+      console.log("Error <><><>>", error);
       addLog(`Error withdrawing custody balance: ${error.message || error}`);
     } finally {
       setIsWithdrawingCustodyBalance(false);
@@ -701,7 +736,9 @@ export default function App() {
 
           const authParams = authParamsRef.current;
           if (!authParams) {
-            addLog("Error: Missing auth params. Please click Authenticate again.");
+            addLog(
+              "Error: Missing auth params. Please click Authenticate again.",
+            );
             return;
           }
 
@@ -732,12 +769,18 @@ export default function App() {
           ws.send(ledgerMsg);
           addLog("Sent get_ledger_balances request...");
         }
-        if(response.res && response.res[1] === "get_ledger_balances") {
+        if (response.res && response.res[1] === "get_ledger_balances") {
           const ledgerBalances = response.res[2].ledger_balances;
           console.log("Ledger Balances <><><>>", ledgerBalances);
           const bal = ledgerBalances.find((b: any) => b.asset === "usdc");
           addLog(`Ledger Balances <><><>> ${bal?.amount}`);
           console.log("Ledger Balances <><><>>", ledgerBalances);
+        }
+        if (response.res && response.res[1] === "get_ledger_transactions") {
+          const ledgerTransactions = response.res[2];
+          console.log("Ledger Transactions <><><>>", ledgerTransactions);
+          addLog(`✓ Received ledger transactions: ${JSON.stringify(ledgerTransactions)}`);
+          setIsFetchingLedgerTransactions(false);
         }
         if (response.res && response.res[1] === "channels") {
           const channels = response.res[2].channels;
@@ -1094,7 +1137,9 @@ export default function App() {
       return;
     }
     if (!sessionKeyRef.current) {
-      addLog("Error: Session key not initialized. Please click Start Flow first.");
+      addLog(
+        "Error: Session key not initialized. Please click Start Flow first.",
+      );
       return;
     }
     if (isAuthenticatedRef.current) {
@@ -1103,19 +1148,17 @@ export default function App() {
     }
 
     try {
-      const authParams =
-        authParamsRef.current ||
-        {
-          session_key: sessionKeyRef.current.address,
-          allowances: [
-            {
-              asset: "usdc",
-              amount: "1000000000",
-            },
-          ],
-          expires_at: BigInt(Math.floor(Date.now() / 1000) + 3600),
-          scope: "test.app",
-        };
+      const authParams = authParamsRef.current || {
+        session_key: sessionKeyRef.current.address,
+        allowances: [
+          {
+            asset: "usdc",
+            amount: "1000000000",
+          },
+        ],
+        expires_at: BigInt(Math.floor(Date.now() / 1000) + 3600),
+        scope: "test.app",
+      };
 
       authParamsRef.current = authParams;
 
@@ -1127,7 +1170,9 @@ export default function App() {
 
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-        addLog("Error: WebSocket not connected. Please click Start Flow first.");
+        addLog(
+          "Error: WebSocket not connected. Please click Start Flow first.",
+        );
         return;
       }
 
@@ -1425,6 +1470,23 @@ export default function App() {
             }}
           >
             {isFetchingChannels ? "Fetching..." : "Get Channels"}
+          </button>
+
+          <button
+            onClick={handleGetLedgerTransactions}
+            disabled={!account || !wsRef.current || isFetchingLedgerTransactions}
+            style={{
+              padding: "12px",
+              backgroundColor: "#6f42c1",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontWeight: "bold",
+              fontSize: "14px",
+            }}
+          >
+            {isFetchingLedgerTransactions ? "Fetching..." : "Get Ledger Transactions"}
           </button>
 
           <button
